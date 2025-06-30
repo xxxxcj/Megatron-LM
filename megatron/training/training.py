@@ -1237,6 +1237,9 @@ def train_step(forward_step_func, data_iterator,
         optimizer.zero_grad()
 
         # Forward pass.
+        """
+        前向和反向传播, 其中梯度的reduce-scatter在反向传播后进行
+        """
         forward_backward_func = get_forward_backward_func()
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
@@ -1261,16 +1264,18 @@ def train_step(forward_step_func, data_iterator,
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
     # Update parameters.
-
+    """更新权重，并进行同步"""
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
+    """有freezing子模型时, 可能混合成功和不成功的rank, 需要对所有状态做一个逻辑and  有点怪参数已经update了 但是学习率不更新"""
     update_successful = logical_and_across_model_parallel_group(update_successful)
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
+    """grad norm做max 求全局最大norm"""
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
     if args.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
@@ -1281,6 +1286,7 @@ def train_step(forward_step_func, data_iterator,
         unwrapped_model.update_momentum(args.curr_iteration)
 
     # Update learning rate.
+    """更新学习率"""
     if update_successful:
         increment = get_num_microbatches() * \
                     args.micro_batch_size * \

@@ -53,6 +53,7 @@ class DistributedDataParallel(_BaseDataParallel):
         # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
         # ring-reduce implementations are large enough to remain bandwidth-bound rather than
         # latency-bound.
+        """如果没有提供 bucket_size 作为输入，则使用正常默认值。"""
         if ddp_config.bucket_size is None:
             ddp_config.bucket_size = max(
                 40000000, 1000000 * parallel_state.get_data_parallel_world_size()
@@ -81,6 +82,7 @@ class DistributedDataParallel(_BaseDataParallel):
         self.param_to_bucket_group = {}
 
         # Group parameters by their gradient type.
+        """参数分类, 分为dense参数和专家并行参数"""
         param_to_name = {}
         dense_params = []
         expert_parallel_params = []
@@ -109,6 +111,7 @@ class DistributedDataParallel(_BaseDataParallel):
             param_and_grad_dtype_to_indices = {}
 
             # Group parameters by their gradient type.
+            """根据参数数据类型对params做个分类"""
             for param in input_params:
                 assert param.requires_grad
 
@@ -176,6 +179,7 @@ class DistributedDataParallel(_BaseDataParallel):
                     assert gradient_scaling_factor == target_gradient_scaling_factor
 
             # Allocate the grad buffers and map the grads.
+            """分param和grad的参数类别创建buffer"""
             buffers = []
             for (param_dtype, grad_dtype), params in param_and_grad_dtype_to_params.items():
                 buffers.append(
@@ -201,6 +205,10 @@ class DistributedDataParallel(_BaseDataParallel):
             # kernels.
             # If bucketing is explicitly disabled, then put all buckets in a buffer into a single
             # bucket group.
+            """在某些情况下，我们希望将来自不同缓冲区的水桶放到一个组中，以便聚合它们的通信。例如，当模型中
+            同时存在 fp8 缓冲区和 bf16 缓冲区并启用 vpp 时，每个模型块都将有一个 fp8 桶和一个 bf16 桶，这
+            将使通信内核的数量翻倍，而且由于使用了 CUDA_DEVICE_MAX_CONNECTIONS=1，多个背靠背通信将防止通
+            信内核与计算内核重叠。如果显式禁用了桶组，则应将缓冲区中的所有桶放入一个桶组中。"""
             bucket_groups = partition_buckets(buffers, force_single_bucket_group=disable_bucketing)
 
             if self.ddp_config.num_distributed_optimizer_instances > 1:
@@ -276,6 +284,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate the param+grad buffers for dense params' grads.
+        """创建参数+梯度的buffer"""
         self.buffers, self.bucket_groups = _allocate_buffers_for_parameters(
             dense_params,
             parallel_state.get_data_parallel_group(

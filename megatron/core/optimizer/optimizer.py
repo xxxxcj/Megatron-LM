@@ -449,6 +449,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-inner-step', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
+        """step"""
         if not self.is_stub_optimizer:
             self.optimizer.step()
         if timers is not None:
@@ -459,6 +460,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
             timers('optimizer-copy-main-to-model-params', log_level=1).start(
                 barrier=self.config.barrier_with_L1_time
             )
+        """主参数同步到模型参数"""
         if not self.is_stub_optimizer:
             self._copy_main_params_to_model_params()
         if timers is not None:
@@ -1122,10 +1124,12 @@ class ChainedOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def step(self):
         """ChainedOptimizer will step all optimizers one by one."""
+        """跳过不合法的梯度"""
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
             return False, None, None
 
+        """计算所有参数的梯度范数(L2 norm), 用于后续的梯度裁剪。"""
         grad_norm = self.get_grad_norm()
 
         # Clip gradients.
@@ -1140,7 +1144,7 @@ class ChainedOptimizer(MegatronOptimizer):
                     use_decoupled_grad=optimizer.config.use_precision_aware_optimizer,
                 )
 
-        # Count the zeros in the grads.
+        # Count the zeros in the grads. 通常用于监控梯度稀疏性
         num_zeros_in_grad = self.count_zeros()
 
         update_successful = self.step_with_ready_grads()

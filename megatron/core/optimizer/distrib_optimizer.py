@@ -120,6 +120,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for param, param_world_indexes in param_world_index_map.items():
 
             # Param range.
+            """
+            这里切分range: 假如有如下buffer 0          10         20
+                                          |__________|___________|
+            有一个参数的param_world_start = 8, param_world_end = 12;
+            rank0: param_local_start = 8, param_local_end = 10;
+            rank1: param_local_start = 0, param_local_start = 2;
+            刚好会被两个rank切分。
+            """
             param_world_start, param_world_end, _ = param_world_indexes
             param_local_start = max(0, param_world_start - gbuf_world_range.start)
             param_local_end = min(gbuf_world_range.size, param_world_end - gbuf_world_range.start)
@@ -135,7 +143,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 )
                 sub_param_start = max(0, gbuf_world_range.start - param_world_start)
                 sub_param_range = param_local_range.normalize(sub_param_start)
-                param_range_map[param] = {
+                param_range_map[param] = {  # tensor居然有__hash__方法，应该是使用内存进行hash的
                     "gbuf_world": param_world_range,
                     "gbuf_world_in_bucket": param_world_range_in_bucket,
                     "gbuf_local": param_local_range,
@@ -164,6 +172,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         assert (
             gbuf_size % data_parallel_world_size == 0
         ), f"Each bucket's buffer size should be divisible by {data_parallel_world_size}"
+        """在这里size变成了一半"""
         max_gbuf_range_size = gbuf_size // data_parallel_world_size
 
         # All world ranges (i.e., across all data parallel ranks).
@@ -443,6 +452,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         parameters, and parameter shard ranges, that is needed for converting between model
         param indexes and main parameter shard indexes. This method also updates the optimizer
         parameter groups with the newly created shards.
+        此方法中的步骤创建了参数和 grad 缓冲区、参数和参数分区范围之间的核心映射，这是模型参数索引和主参数分区索引之间转换所需的。此方法还会使用新创建的分区更新优化器参数组。
 
         Args:
             optimizer (torch.optim.Optimizer): base optimizer such as Adam or SGD.
@@ -475,7 +485,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.model_chunks = model_chunks
         self.ddp_config = self.model_chunks[0].ddp_config
         for model_chunk in self.model_chunks:
-            assert self.ddp_config == model_chunk.ddp_config
+            assert self.ddp_config == model_chunk.ddp_config  # model chunk是全部参数
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
 
         assert isinstance(optimizer, (Adam, HybridDeviceOptimizer)) or optimizer is None, (
@@ -531,18 +541,30 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     ]
                 }
             )
-            self.gbuf_ranges.append(self._build_gbuf_range_map(buffer))
+            """
+            这里做的划分, buffer的大小是全参数, gbuf_range中就只有一半的mapping了, gbuf_range对应blog中那张图里面的world index, local index等
+            - The param's range within the entire grad buffer (i.e., world index).
+            - The param's range within the relevant grad bucket's buffer.
+            - The param's range within the DP rank's local view of the grad buffer.
+            - The param's range within itself (i.e., its shard).
+            """
+            self.gbuf_ranges.append(self._build_gbuf_range_map(buffer))  
+        """{param:(gbuf_id, (param.dtype, grad.dtype), buket_id)}"""
         self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges)
 
         # Add main_param field to each parameter. We will use this fp32 copy to compute
         # the param norm.
         # For parameters with optimizer state on this rank, None will be overwritten by
         # the corresponding sharded main_param tensor.
+        """
+        为每个参数添加一个 main_param 字段，用于存储该参数的 FP32 副本, 目前先把 main_param 设为 None, 后面每个 rank 会加载它负责的一部分 FP32 参数 shard, 替换 None
+        """
         for param_group in self.optimizer.param_groups:
             # For all the parameters in this group.
             for param in param_group['params']:
                 if param.requires_grad:
                     # fp32 copy only needed for 16-bit parameters.
+                    """只对 16-bit (FP16 或 BF16) 参数创建 FP32 副本, 因为FP32 参数不需要复制副本"""
                     if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
                         param.main_param = None
                         param.main_param_sharded = True
@@ -553,6 +575,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         )
 
         # Allocate main param shards.
+        """
+        分配main param, 大小为当前rank负责的部分的大小(1/dp_size)
+        具体的opmtimizer state会在第一次step()的时候分配
+        """
         (
             self.model_float16_groups,
             self.model_fp32_groups,
@@ -563,6 +589,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
         )
 
+        """最后优化器self.optimizer.param_groups内params的内存地址与self.shard_fp32_from_float16_groups一致"""
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
                 params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults
@@ -2105,6 +2132,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # the first all-gather is launched asynchronously in the next optimizer.zero_grad()
             # call and subsequent all-gathers are launched in the forward pre-hook.
             if not self.ddp_config.overlap_param_gather:
+                """同步更新后的参数"""
                 for model_chunk in self.model_chunks:
                     model_chunk.start_param_sync()
         if timers is not None:
