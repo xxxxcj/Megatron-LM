@@ -233,6 +233,7 @@ class _ParamAndGradBucketGroup:
                 local_data_view = shard_buffer(
                     bucket.param_data, self.intra_distributed_optimizer_instance_size
                 )[self.intra_distributed_optimizer_instance_rank]
+                """dist_all_gather_func = torch.distributed.all_gather_into_tensor"""
                 dist_all_gather_func(
                     bucket.param_data,
                     local_data_view,
@@ -356,7 +357,7 @@ class _ParamAndGradBucketGroup:
                 if self.ddp_config.use_distributed_optimizer:
                     local_data_view = shard_buffer(
                         bucket.grad_data, self.intra_distributed_optimizer_instance_size
-                    )[self.intra_distributed_optimizer_instance_rank]
+                    )[self.intra_distributed_optimizer_instance_rank]  # 为什么要划分之后取rank_id对应的，不直接取对应的索引？ 不过计算量应该差距不大，都是切分grad_data
                     dist_reduce_scatter_func(
                         local_data_view,
                         bucket.grad_data,
