@@ -1271,7 +1271,7 @@ def train_step(forward_step_func, data_iterator,
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
-    """有freezing子模型时, 可能混合成功和不成功的rank, 需要对所有状态做一个逻辑and  有点怪参数已经update了 但是学习率不更新"""
+    """有freezing子模型时, 可能混合成功和不成功的rank, 需要对所有状态做一个逻辑and  有点怪部分参数已经update了 但是学习率不更新"""
     update_successful = logical_and_across_model_parallel_group(update_successful)
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks

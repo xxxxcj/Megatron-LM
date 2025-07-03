@@ -525,6 +525,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         self.gbuf_ranges = []
         self.per_bucket_numel = []
         self.per_bucket_numel_unpadded = []
+        """
+        对参数进行切分，将每个buffer中的每个桶中的参数均匀分割到不同DistOpt，
+        同时会如果某个权重矩阵恰好在两个DistOpt中间，会对权重矩阵进行切分
+        """
         for buffer in self.buffers:
 
             self.per_bucket_numel.append(
@@ -569,7 +573,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         param.main_param = None
                         param.main_param_sharded = True
 
-        # Optimizer ranges.
+        # Optimizer ranges. 根据self.gbuf_ranges计算实际的param_groups
         (self.model_param_group_index_map, self.opt_group_ranges) = (
             self._build_optimizer_group_ranges(self.optimizer.param_groups, self.gbuf_ranges)
         )
@@ -580,16 +584,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         具体的opmtimizer state会在第一次step()的时候分配
         """
         (
-            self.model_float16_groups,
-            self.model_fp32_groups,
-            self.shard_float16_groups,
-            self.shard_fp32_groups,
-            self.shard_fp32_from_float16_groups,
+            self.model_float16_groups,            # original float16 parameters           即属于当前rank的原始的权重矩阵，如果是需要被切分的，当前保留的还是原始的大小
+            self.model_fp32_groups,               # original fp32 parameters
+            self.shard_float16_groups,            # shards of original float16 parameters 切分且flatten为1D的权重，如果是需要被切分的，保留的为切分后的大小
+            self.shard_fp32_groups,               # shards of original fp32 parameters
+            self.shard_fp32_from_float16_groups,  # fp32 copy of float16 parameters       从fp16复制的，创建的新的tensor
         ) = self._build_model_and_main_param_groups(
             self.gbuf_ranges, self.model_param_gbuf_map, self.opt_group_ranges, config
         )
 
-        """最后优化器self.optimizer.param_groups内params的内存地址与self.shard_fp32_from_float16_groups一致"""
+        """
+        最后优化器self.optimizer.param_groups内params的内存地址与
+        self.shard_fp32_from_float16_groups一致
+        """
         if isinstance(self.optimizer, HybridDeviceOptimizer):
             self.optimizer = HybridDeviceOptimizer(
                 params=[g["orig_group"] for g in self.opt_group_ranges], **self.optimizer.defaults

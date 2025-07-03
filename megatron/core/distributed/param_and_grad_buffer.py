@@ -595,6 +595,10 @@ class _ParamAndGradBuffer:
 
             # If we have enough elements already or the current param is part of the shared
             # embedding layer and needs a separate bucket, form a new bucket.
+            """
+            每个桶的大小不是完全固定的，桶的大小会根据最后参数大小溢出的大小扩大
+            所以不会存在桶的大小太小放不下的问题，如果桶大小设为1，那么每个桶的实际大小就是param的大小
+            """
             if (
                 bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size
             ) or _does_param_require_new_bucket(param):
