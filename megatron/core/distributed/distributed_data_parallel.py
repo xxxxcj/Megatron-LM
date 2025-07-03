@@ -59,7 +59,10 @@ class DistributedDataParallel(_BaseDataParallel):
         # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
         # ring-reduce implementations are large enough to remain bandwidth-bound rather than
         # latency-bound.
-        """如果没有提供 bucket_size 作为输入，则使用正常默认值。"""
+        """
+        1.如果没有提供 bucket_size 作为输入，则使用正常默认值。
+        2.因为采用ring-reduce，模型变大就需要对应调大桶的大小以提高通信效率
+        """
         if ddp_config.bucket_size is None:
             ddp_config.bucket_size = max(
                 40000000, 1000000 * parallel_state.get_data_parallel_world_size()
@@ -208,7 +211,7 @@ class DistributedDataParallel(_BaseDataParallel):
             param.grad_added_to_main_grad = False
             param_to_name[param] = name
 
-            if getattr(param, 'allreduce', True):
+            if getattr(param, 'allreduce', True):  # TE的layer设置了这个参数
                 dense_params.append(param)
             else:
                 expert_parallel_params.append(param)
@@ -281,7 +284,7 @@ class DistributedDataParallel(_BaseDataParallel):
                     assert gradient_scaling_factor == target_gradient_scaling_factor
 
             # Allocate the grad buffers and map the grads.
-            """分param和grad的参数类别创建buffer"""
+            """分param和grad的参数类别创建buffer，一个buffer有多个bucket"""
             buffers = []
             for (param_dtype, grad_dtype), params in param_and_grad_dtype_to_params.items():
                 buffers.append(
@@ -312,7 +315,7 @@ class DistributedDataParallel(_BaseDataParallel):
             同时存在 fp8 缓冲区和 bf16 缓冲区并启用 vpp 时，每个模型块都将有一个 fp8 桶和一个 bf16 桶，这
             将使通信内核的数量翻倍，而且由于使用了 CUDA_DEVICE_MAX_CONNECTIONS=1，多个背靠背通信将防止通
             信内核与计算内核重叠。如果显式禁用了桶组，则应将缓冲区中的所有桶放入一个桶组中。"""
-            bucket_groups = partition_buckets(buffers, force_single_bucket_group=disable_bucketing)
+            bucket_groups = partition_buckets(buffers, force_single_bucket_group=disable_bucketing)  # 因为有时候需要聚合部分bucket，将buffer中的bucket分到不同的group中
 
             if self.ddp_config.num_distributed_optimizer_instances > 1:
                 assert (
@@ -327,6 +330,7 @@ class DistributedDataParallel(_BaseDataParallel):
 
             # Set `next_param_gather_bucket_group` for different bucket groups by iterating through
             # buckets in reverse order (since all-gathers happen in reverse order of buckets).
+            """将桶组串联起来，因为grad的allgather是在buffer上是反向的，因此反向串联,桶的串联顺序是正向的(forward方向)"""
             if self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather:
                 num_bucket_groups = len(bucket_groups)
                 for i in range(1, num_bucket_groups):
@@ -373,6 +377,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 gradient_scaling_factor = 1.0
                 expert_gradient_scaling_factor = self.expt_dp_group.size() / self.dp_cp_group.size()
             else:
+                """先放缩再累加，可以降低梯度求和时overflow的可能，而且如果是低精度通信的话量化误差更小"""
                 data_parallel_world_size = self.dp_cp_group.size()
 
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
@@ -413,7 +418,7 @@ class DistributedDataParallel(_BaseDataParallel):
         for param in self.module.parameters():
             if param.requires_grad:
                 # Expand so we get access to grad_fn.
-                param_tmp = param.expand_as(param)
+                param_tmp = param.expand_as(param)  # 制造出一个张量 view，从而触发 autograd 生成 grad_fn，param是leaf tensor默认不带grad_fn
                 # Get the gradient accumulator function.
                 grad_acc = param_tmp.grad_fn.next_functions[0][0]
                 grad_acc.register_hook(self._make_backward_post_hook(param))
@@ -462,7 +467,7 @@ class DistributedDataParallel(_BaseDataParallel):
         when a module uses a parameter in a bucket with a still incomplete all-gather).
         """
 
-        def hook(module, *unused):
+        def hook(module, *unused):  # 参数module只是当前被hook的模块
             assert (
                 self.use_forward_hook
             ), "Should use pre-hook only when overlap_param_gather is True"

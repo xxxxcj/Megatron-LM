@@ -690,6 +690,7 @@ def get_megatron_optimizer(
     for dense_model_chunks, overlap_param_gather_with_optimizer_step in zip(
         all_dense_model_chunks, overlap_param_gather_with_optimizer_step_flags
     ):
+        """分成两组，因为bias不需要进行wd（梯度衰减）"""
         param_groups, buffers = _get_param_groups_and_buffers(
             dense_model_chunks,
             model_chunk_offset=model_chunk_offset,
