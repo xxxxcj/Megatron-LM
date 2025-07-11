@@ -40,10 +40,10 @@ class LanguageModelEmbedding(MegatronModule):
         self.vocab_size: int = vocab_size
         self.max_sequence_length: int = max_sequence_length
         self.add_position_embedding: bool = position_embedding_type == 'learned_absolute'
-        self.num_tokentypes = num_tokentypes
+        self.num_tokentypes = num_tokentypes  # bert 需要的区分不同句子的embedding (from gpt)
         self.scatter_to_sequence_parallel = scatter_to_sequence_parallel
         self.reduce_scatter_embeddings = (
-            (not self.add_position_embedding)
+            (not self.add_position_embedding)  # 只reduce不scatter learned_absolute需要完整的word embedding（在forward L130做的scatter），rope不需要完整的word embedding因此不需要scatter
             and self.num_tokentypes <= 0
             and self.config.sequence_parallel
             and self.scatter_to_sequence_parallel
@@ -68,7 +68,7 @@ class LanguageModelEmbedding(MegatronModule):
             if self.config.perform_initialization:
                 self.config.init_method(self.position_embeddings.weight)
 
-        if self.num_tokentypes > 0:
+        if self.num_tokentypes > 0:  # bert 需要的区分不同句子的embedding (from gpt)
             self.tokentype_embeddings = torch.nn.Embedding(
                 self.num_tokentypes, self.config.hidden_size
             )
@@ -103,8 +103,8 @@ class LanguageModelEmbedding(MegatronModule):
         Returns:
             Tensor: The output embeddings
         """
-        word_embeddings = self.word_embeddings(input_ids)
-        if self.add_position_embedding:
+        word_embeddings = self.word_embeddings(input_ids) #已经做了reduce了
+        if self.add_position_embedding:  # position_embedding_type == 'learned_absolute'
             position_embeddings = self.position_embeddings(position_ids)
             embeddings = word_embeddings + position_embeddings
         else:
@@ -135,7 +135,7 @@ class LanguageModelEmbedding(MegatronModule):
             # Has a small runtime cost (~0.5%).
             if self.config.clone_scatter_output_in_embedding and self.scatter_to_sequence_parallel:
                 embeddings = embeddings.clone()
-            with tensor_parallel.get_cuda_rng_tracker().fork():
+            with tensor_parallel.get_cuda_rng_tracker().fork():  # 让随机独立 rng: random number generator
                 embeddings = self.embedding_dropout(embeddings)
         else:
             embeddings = self.embedding_dropout(embeddings)

@@ -198,7 +198,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.embedding_dim = embedding_dim
         self.reduce_scatter_embeddings = reduce_scatter_embeddings
         self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
-        # Divide the weight matrix along the vocaburaly dimension.
+        # Divide the weight matrix along the vocaburaly dimension.  根据张量并行的配置计算每个GPU分区应该处理的词汇表范围
         (self.vocab_start_index, self.vocab_end_index) = (
             VocabUtility.vocab_range_from_global_vocab_size(
                 self.num_embeddings,
@@ -209,15 +209,16 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.num_embeddings_per_partition = self.vocab_end_index - self.vocab_start_index
         self.deterministic_mode = config.deterministic_mode
 
-        # Allocate weights and initialize.
+        # Allocate weights and initialize. 
         if config.use_cpu_initialization:
             self.weight = Parameter(
                 torch.empty(
                     self.num_embeddings_per_partition, self.embedding_dim, dtype=config.params_dtype
                 )
             )
+            """在CPU上创建完整权重矩阵"""
             if config.perform_initialization:
-                _initialize_affine_weight_cpu(
+                _initialize_affine_weight_cpu(  
                     self.weight,
                     self.num_embeddings,
                     self.embedding_dim,

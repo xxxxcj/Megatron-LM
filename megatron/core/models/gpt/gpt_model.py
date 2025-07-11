@@ -101,10 +101,10 @@ class GPTModel(LanguageModule):
         self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
-        self.pre_process = pre_process
-        self.post_process = post_process
-        self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
-        self.parallel_output = parallel_output
+        self.pre_process = pre_process                      # embedding
+        self.post_process = post_process                    # output layer
+        self.fp16_lm_cross_entropy = fp16_lm_cross_entropy  # Defaults to False.
+        self.parallel_output = parallel_output              # Do not gather the outputs, keep them split across tensor parallel ranks.
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
 
         if hasattr(self.config, 'position_embedding_type'):
@@ -266,7 +266,7 @@ class GPTModel(LanguageModule):
         if decoder_input is not None:
             pass
         elif self.pre_process:
-            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids) # 过了embedding seq变一半了
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
@@ -386,6 +386,7 @@ class GPTModel(LanguageModule):
             and inference_context.materialize_only_last_token_logits
         ):
             hidden_states = hidden_states[-1:, :, :]
+        # [seq, b, vocab_size/N] 所以输出层的col parallel linear在有seq parallel也需要先有一个all gather
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )

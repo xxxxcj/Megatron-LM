@@ -75,6 +75,9 @@ class ModelParallelConfig:
     """When set to False, we initialize the weights directly on the GPU. CPU initialization is the
        same regardless of tensor model parallelism, but GPU initialization is not. Transferring
        weights from CPU to GPU can take a significant amount of time for large models.
+       true的好处:
+       1. 减少GPU显存占用高峰
+       2. 避免PyTorch中的潜在内存碎片
     """
 
     ###################

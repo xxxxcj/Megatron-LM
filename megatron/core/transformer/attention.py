@@ -709,7 +709,7 @@ class SelfAttention(Attention):
         )
 
         if submodules.q_layernorm is not None:
-            self.q_layernorm = build_module(
+            self.q_layernorm = build_module(  # IdentityOP
                 submodules.q_layernorm,
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
@@ -806,7 +806,7 @@ class SelfAttention(Attention):
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
         mixed_qkv, _ = self.linear_qkv(hidden_states)
 
-        # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
+        # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn] GQA的处理[sq, b, num_groups, group_total_hidden]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
             self.num_query_groups_per_partition,
             (
