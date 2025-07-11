@@ -129,7 +129,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         )
         torch.distributed.all_reduce(
             logits_max, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group()
-        )
+        )# 求最大值用来防止溢出
 
         # Get the partition's vocab indices
         get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size

@@ -307,7 +307,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.layer_number = layer_number + get_transformer_layer_offset(self.config, vp_stage)
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
 
-        # [Module 1: Input Layernorm] Optional Layernorm on the input data
+        # [Module 1: Input Layernorm] Optional Layernorm on the input data  这里是identityOP 真的layernorm融合到self attn中的第一层linear了
         # TODO: add pytorch only layernorm
         self.input_layernorm = build_module(
             submodules.input_layernorm,

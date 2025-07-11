@@ -268,9 +268,9 @@ class TransformerBlock(MegatronModule):
         super().__init__(config=config)
 
         self.submodules = _get_block_submodules(config, spec, vp_stage)
-        self.post_layer_norm = post_layer_norm
-        self.pre_process = pre_process
-        self.post_process = post_process
+        self.post_layer_norm = post_layer_norm  # 是否在最后一层后加LayerNorm
+        self.pre_process = pre_process          # pp参数
+        self.post_process = post_process        # 是否在最后一层后加后处理，与post_layer_norm共同决定加不加layernorm
         self.vp_stage = vp_stage
 
         # required for pipeline parallel schedules
