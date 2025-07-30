@@ -849,7 +849,7 @@ def pretrain(
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
     if args.virtual_pipeline_model_parallel_size is not None:
-        train_data_iterator = []
+        train_data_iterator = []  # rank0:[data, None, None]  rank_last:[None, None, data]
         valid_data_iterator = []
         test_data_iterator = []
         for i in range(len(model)):
