@@ -188,6 +188,8 @@ class GPTModel(LanguageModule):
                 # input activations stored in embedding activation buffer and gradient outputs
                 # stored in gradient buffer to calculate the weight gradients for the embedding
                 # final linear layer.
+                # 不在每次反向传播时就立刻更新 embedding 层的梯度，
+                # 而是等所有小批次的反传都做完，再统一处理，这样做更高效，也避免重复计算。
                 self.embedding_activation_buffer = []
                 self.grad_output_buffer = []
             else:
@@ -266,7 +268,7 @@ class GPTModel(LanguageModule):
         if decoder_input is not None:
             pass
         elif self.pre_process:
-            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids) # 过了embedding seq变一半了
+            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids) # tp:过了embedding seq变一半了
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor

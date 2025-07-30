@@ -580,14 +580,14 @@ def get_pp_rank_microbatches(
     pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
     virtual_pipeline_parallel_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
 
-    total_num_microbatches = num_microbatches * num_model_chunks
+    total_num_microbatches = num_microbatches * num_model_chunks  # 每个rank要跑的总的microbatch数
     are_all_microbatches_in_warmup = False
 
     if forward_only:
         num_warmup_microbatches = total_num_microbatches
     elif pipeline_parallel_size > 1:
         if virtual_pipeline_parallel_size is None:
-            # forward_backward_pipelining_without_interleaving
+            # forward_backward_pipelining_without_interleaving 没有交错的话最后一个rank是马上开始1f1b，所以是pp size - rank - 1
             num_warmup_microbatches = pipeline_parallel_size - pipeline_parallel_rank - 1
         else:
             # forward_backward_pipelining_with_interleaving
@@ -595,8 +595,8 @@ def get_pp_rank_microbatches(
             # all workers, followed by more microbatches after depending on
             # stage ID (more forward passes for earlier stages, later stages can
             # immediately start with 1F1B).
-            num_warmup_microbatches = (pipeline_parallel_size - pipeline_parallel_rank - 1) * 2
-            num_warmup_microbatches += (num_model_chunks - 1) * microbatch_group_size_per_vp_stage
+            num_warmup_microbatches = (pipeline_parallel_size - pipeline_parallel_rank - 1) * 2     # bwd需要的时间大约是fwd的两倍 在填满流水线的前提下尽可能的多跑fwd 这样刚好能卡着最后一个rank跑满
+            num_warmup_microbatches += (num_model_chunks - 1) * microbatch_group_size_per_vp_stage  # pp bwd是先最后一个chunk的，所以要先跑chunk_num-1次的fwd
     else:
         # forward_backward_no_pipelining
         num_warmup_microbatches = 1
@@ -617,7 +617,7 @@ def get_pp_rank_microbatches(
 def get_schedule_table(num_microbatches, num_model_chunks, microbatch_group_size_per_vp_stage):
     """Get the schedule table for PP scheduling."""
     schedule_table = []
-    for min_microbatch_id_in_group in range(
+    for min_microbatch_id_in_group in range(  # 本质上是一个3重循环，先确定在第几次连续处理的microbatch，再确定是哪个chunk，最后再确定是具体哪个microbatch
         0, num_microbatches, microbatch_group_size_per_vp_stage
     ):
         if min_microbatch_id_in_group + microbatch_group_size_per_vp_stage >= num_microbatches:
@@ -707,14 +707,17 @@ def forward_backward_pipelining_with_interleaving(
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
 
-    # Needed only when gradients are finalized in M-Core
+    # Needed only when gradients are finalized in M-Core 
+    # M-Core指Megatron Core？所以是如果在Megatron中聚合梯度就需要清空buffer中的激活值？
+    # buffer的解释注释在 gpt_model.py:188-201  不在每次反向传播时就立刻更新 embedding 层的梯度，而是等所有小批次的反传都做完，再统一处理
+    # 这里的清空应该是为了避免在梯度聚合时使用到上一个batch的激活值
     if config.finalize_model_grads_func is not None and not forward_only:
         embedding_module = clear_embedding_activation_buffer(config, model)
 
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
-    # Disable async grad reductions
+    # Disable async grad reductions  混合DP时的参数，用于控制梯度同步的时机 这里只是获取到一个上下文，后续包裹到 disable_grad_sync() enable_grad_sync()函数中 控制的是数据并行维度的梯度同步(form deepwiki)
     no_sync_func = config.no_sync_func
     if isinstance(no_sync_func, list):
 
@@ -728,7 +731,7 @@ def forward_backward_pipelining_with_interleaving(
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
     no_sync_context = None
-
+    # 用于手动控制梯度和参数的同步，这个也是和DP相关的，training.py:2102-2117
     if config.grad_sync_func is not None and not isinstance(config.grad_sync_func, list):
         config.grad_sync_func = [config.grad_sync_func for _ in model]
 
@@ -761,8 +764,8 @@ def forward_backward_pipelining_with_interleaving(
     # Model chunk IDs with synchronized grads
     synchronized_model_chunks = set()
 
-    input_tensors = [[] for _ in range(len(model))]
-    output_tensors = [[] for _ in range(len(model))]
+    input_tensors = [[] for _ in range(len(model))]   # 长度等于当前rank的chunk数量，保存每个chunk将要使用的input tensor
+    output_tensors = [[] for _ in range(len(model))]  # 模型chunk的大小
     total_num_tokens = torch.tensor(0, dtype=torch.int).cuda()
 
     forward_data_store = []
@@ -786,7 +789,9 @@ def forward_backward_pipelining_with_interleaving(
         raise ValueError(msg)
 
     # If the final micro-batch group has fewer micro-batches than pipeline-parallel size,
-    # the pipeline will have dependency bubbles.
+    # the pipeline will have dependency bubbles. 
+    # 如果余下来的微batch数量小于pp size会有额外的依赖bubbles，所以要求余数==0或者>=pp size
+    # 因为是交错的，如果余数小于pp size，那么在最后处理余数的micro-batch时第二次forward(chunk id == 2)时会依赖第一次forward的结果，就会额外引入气泡
     final_microbatch_group_size = num_microbatches % config.microbatch_group_size_per_vp_stage
     if 0 < final_microbatch_group_size < pipeline_parallel_size:
         msg = 'The remainder of M (the total micro-batches) divided by N (number of '
@@ -798,12 +803,12 @@ def forward_backward_pipelining_with_interleaving(
         raise RuntimeError(msg)
 
     model_type = get_model_type(model[0])
-
+    # 根据模型类型（特别是是否为 Encoder-Decoder 模型），决定 tensor 的形状（tensor_shape)
     if model_type == ModelType.encoder_and_decoder:
-        xattn_needed = get_model_xattn(model)
+        xattn_needed = get_model_xattn(model)  # xattn==cross attn
         assert (
             not xattn_needed
-        ), "Interleaving is not supported when xattn is required between encoder and decoder"
+        ), "Interleaving is not supported when xattn is required between encoder and decoder"  # 交错pp不支持xattn
         tensor_shape = get_tensor_shapes(
             rank=parallel_state.get_pipeline_model_parallel_rank(),
             model_type=model_type,
@@ -827,8 +832,8 @@ def forward_backward_pipelining_with_interleaving(
     (
         total_num_microbatches,
         are_all_microbatches_in_warmup,
-        num_warmup_microbatches,
-        num_microbatches_remaining,
+        num_warmup_microbatches,    # 个人理解为pp中，forward only的部分，warmup之后流水线就被填满了，就可以开始1f1b了
+        num_microbatches_remaining, # 个人理解为pp中 1f1b的部分
     ) = get_pp_rank_microbatches(
         num_microbatches, num_model_chunks, config.microbatch_group_size_per_vp_stage, forward_only
     )
@@ -854,6 +859,10 @@ def forward_backward_pipelining_with_interleaving(
     # The schedule lookup table uses the virtual_microbatch_id to find the corresponding
     # microbatch_id and model_chunk_id. For example, the tunable schedule table for
     # PP2 N3M5 with VP2 is constructed as below:
+    # M (the total micro-batches) 
+    # N (number of contiguous micro-batches in a virtual pipeline stage) 由--microbatch-group-size-per-virtual-pipeline-stage参数控制 
+    # 为了提高吞吐率，可以让一个 chunk 一次性处理多个 micro-batch（batch 粒度更大）
+    # M 除以 N 要么整除，要么余数要大于等于 pipeline-stage 数
     # virtual_microbatch_id | 0 1 2 3 4 5 6 7 8 9
     # microbatch_id         | 0 1 2 0 1 2 3 4 3 4
     # model_chunk_id        | 0 0 0 1 1 1 0 0 1 1
@@ -1080,20 +1089,23 @@ def forward_backward_pipelining_with_interleaving(
         return input_tensor_grad
 
     # Run warmup forward passes.
-    parallel_state.set_virtual_pipeline_model_parallel_rank(0)
-    input_tensors[0].append(p2p_communication.recv_forward(tensor_shape, config))
+    parallel_state.set_virtual_pipeline_model_parallel_rank(0)                     # 默认运行在chunk 0
+    input_tensors[0].append(p2p_communication.recv_forward(tensor_shape, config))  # 获取chunk 0的输入，但是如果chunk 0的输入直接是训练数据，那么还是由data iterator提供
 
     fwd_wait_handles = None
     fwd_wait_recv_handles = None
     bwd_wait_handles = None
     bwd_wait_recv_handles = None
-    if parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+    # rank0:  如果连续处理的microbatch数量大于pp size，那么在chunk1进行fwd的时候需要接收部分在chunk0已经完成fwd的input tensor先缓存着 
+    #         假如microbatch group为6 pp size为4，当1处理完的时候，rank0刚处理完4，开始处理5 所以需要microbatch group - pp size + 1 的buffer
+    # 非rank0:都是接收上一rank的数据，所以buffer为1
+    if parallel_state.is_pipeline_first_stage(ignore_virtual=True):  # 如果 ignore_virtual=True 通过rank判断是否是第0 rank，false时就判断chunk id
         fwd_recv_buffer_size = (
             config.microbatch_group_size_per_vp_stage - pipeline_parallel_size + 1
-        )
+        )  
     else:
         fwd_recv_buffer_size = 1
-    if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+    if parallel_state.is_pipeline_last_stage(ignore_virtual=True):  # 同理 但是是反方向的，所以是最后一个rank需要buffer
         bwd_recv_buffer_size = (
             config.microbatch_group_size_per_vp_stage - pipeline_parallel_size + 1
         )
@@ -1101,32 +1113,35 @@ def forward_backward_pipelining_with_interleaving(
         bwd_recv_buffer_size = 1
     fwd_recv_buffer = [None] * fwd_recv_buffer_size
     bwd_recv_buffer = [None] * bwd_recv_buffer_size
-    recv_prev_wait_handles = []
+    recv_prev_wait_handles = []  # fwd的handle    对于接收小于rank id叫prev， 大于rank id叫next
     send_next_wait_handle = None
     send_prev_wait_handle = None
-    recv_next_wait_handles = []
-
+    recv_next_wait_handles = []  # bwd的handle
+    
+    # 先warmup
     for k in range(num_warmup_microbatches):
-        cur_model_chunk_id = get_model_chunk_id(k, forward=True)
+        cur_model_chunk_id = get_model_chunk_id(k, forward=True)  # 根据 调度表 获取当前的chunk id
         parallel_state.set_virtual_pipeline_model_parallel_rank(cur_model_chunk_id)
 
         if config.overlap_p2p_comm_warmup_flush:
-            if not parallel_state.is_pipeline_first_stage() and k != 0:
+            if not parallel_state.is_pipeline_first_stage() and k != 0:  # 非第一个chunk
                 assert recv_prev_wait_handles, (
                     f'pp rank {pipeline_parallel_rank}, iteration {k},'
                     'should have registered recv handle'
                 )
-                recv_prev_wait_handle = recv_prev_wait_handles.pop(0)
+                recv_prev_wait_handle = recv_prev_wait_handles.pop(0) # overlap+不是第一阶段，说明overlap的需要接收的input tensor 所有需要等待接收完成
                 recv_prev_wait_handle.wait()
 
-        # Determine if tensor should be received from previous stage.
+        # Determine if tensor should be received from previous stage. 确定是否应接收前一阶段的张量用于下一轮的计算 （recv_prev 是接收用于下一轮即k+1轮的计算）
         recv_prev, next_forward_model_chunk_id = recv_tensor_from_previous_stage(k, forward=True)
 
-        # No receive in last iteration when recv iteration k+1.
+        # No receive in last iteration when recv iteration k+1. 如果是最后一轮，说明没有k+1的张量需要接收了
         if k == (total_num_microbatches - 1):
             recv_prev = False
 
-        # Prefetch recv for iteration k+1 for non-first ranks.
+        # Prefetch recv for iteration k+1 for non-first ranks. 对于非rank0进行prefetch  
+        # 为什么rank0的非chunk0不能进行prefetch？ 改成rank0的chunk1及以后预取的话代码也能正常跑。。。 (如果microbatch group > pp size的话 fwd buffer会提前接收数据，就没有预取的必要了)  
+        # warmup阶段的overlap真的能够掩盖吗，假如需要rank1需要k+1的数据，但是这个数据在rank0上正在被计算，只是提前发起了通信请求 感觉只能部分掩盖
         if config.overlap_p2p_comm_warmup_flush and not parallel_state.is_pipeline_first_stage(
             ignore_virtual=True
         ):
@@ -1140,7 +1155,7 @@ def forward_backward_pipelining_with_interleaving(
                 )
             )
 
-            if fwd_wait_recv_handles:
+            if fwd_wait_recv_handles:  # 保存等待句柄（wait handles）
                 recv_prev_wait_handles.append(fwd_wait_recv_handles.pop("recv_prev"))
 
         # Decide to checkpoint all layers' activations of the current micro-batch.
@@ -1152,6 +1167,7 @@ def forward_backward_pipelining_with_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        # forward 
         microbatch_id = get_microbatch_id_in_model_chunk(k, forward=True)
         output_tensor = forward_step_helper(k, microbatch_id, checkpoint_activations_microbatch)
 
@@ -1161,38 +1177,39 @@ def forward_backward_pipelining_with_interleaving(
 
         # Send and receive tensors as appropriate (send tensors computed
         # in this iteration; receive tensors for next iteration).
+        # 发送本轮计算的张量，接收下一轮的张量
         if not config.overlap_p2p_comm_warmup_flush:
             if (
-                k == (num_warmup_microbatches - 1)
-                and not config.overlap_p2p_comm
-                and not forward_only
-                and not are_all_microbatches_in_warmup
+                k == (num_warmup_microbatches - 1)      # warmup的最后一轮 and 不是只有warmup  需要这个分支是因为接下来到steady了 需要接收bwd的梯度了
+                and not config.overlap_p2p_comm         # 从pipeline的调度图可以看到，warmup的最后一轮算完马上就需要接收rank+1的反向传播梯度了
+                and not forward_only                    # 同时也需要接收rank-1的input tensor用于steady阶段的forward
+                and not are_all_microbatches_in_warmup  # all warmup就没有提前发起接收梯度 所以需要在flush out阶段显式接收梯度 to L1478
             ):
                 input_tensor_grad = None
                 recv_next = True
                 if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                     recv_next = False
                 (input_tensor, output_tensor_grad) = (
-                    p2p_communication.send_forward_backward_recv_forward_backward(
-                        output_tensor,
+                    p2p_communication.send_forward_backward_recv_forward_backward( # 在这里等待rank+1完成fwd+bwd，并将需要的数据传过来在steady阶段开始1f1b
+                        output_tensor,                                             # 如果是最后一个rank，那么不用接收梯度(recv_next=False)，只需要将fwd结果发给rank0
                         input_tensor_grad,
                         recv_prev=recv_prev,
-                        recv_next=recv_next,
+                        recv_next=recv_next,                                        # 梯度为None 所以主要作用是接收梯度
                         tensor_shape=tensor_shape,
                         config=config,
                     )
                 )
                 output_tensor_grads[num_model_chunks - 1].append(output_tensor_grad)
             else:
-                input_tensor = p2p_communication.send_forward_recv_forward(
+                input_tensor = p2p_communication.send_forward_recv_forward(  # overlap_p2p_comm=False的话 return就没有handle
                     output_tensor, recv_prev=recv_prev, tensor_shape=tensor_shape, config=config
                 )
-            if recv_prev:
+            if recv_prev:  # 如果需要接收前一阶段的张量用于下一次forward就保存到input_tensors中
                 input_tensors[next_forward_model_chunk_id].append(input_tensor)
             deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
-        else:
-            if not parallel_state.is_pipeline_first_stage(ignore_virtual=True):
-                # Send only since recv prefetched.
+        else:  # warmup overlap
+            if not parallel_state.is_pipeline_first_stage(ignore_virtual=True):  # 非rank0
+                # Send only since recv prefetched. 只发送 因为前面已经预取了
                 _, fwd_wait_handles = p2p_communication.send_forward_recv_forward(
                     output_tensor,
                     recv_prev=False,
@@ -1204,7 +1221,7 @@ def forward_backward_pipelining_with_interleaving(
                 fwd_recv_buffer[k % fwd_recv_buffer_size], fwd_wait_handles = (
                     p2p_communication.send_forward_recv_forward(
                         output_tensor,
-                        recv_prev=recv_prev,
+                        recv_prev=recv_prev,  # bool 是否需要接收prev
                         tensor_shape=tensor_shape,
                         config=config,
                         overlap_p2p_comm=True,
@@ -1219,26 +1236,26 @@ def forward_backward_pipelining_with_interleaving(
                 if "recv_prev" in fwd_wait_handles:
                     recv_prev_wait_handles.append(fwd_wait_handles.pop("recv_prev"))
 
-            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)
-            if recv_prev:
+            deallocate_output_tensor(output_tensor, config.deallocate_pipeline_outputs)  # 释放data字段减少显存，但并不真的释放整个 Tensor 对象（因为它的 .grad_fn 还要参与反向传播） output的data不参与梯度计算
+            if recv_prev: # 如果需要接收前一阶段的张量用于下一次forward就保存到input_tensors中
                 input_tensors[next_forward_model_chunk_id].append(
                     fwd_recv_buffer[k % fwd_recv_buffer_size]
                 )
                 fwd_recv_buffer[(k + 1) % fwd_recv_buffer_size] = None
 
-        if config.overlap_p2p_comm:
+        if config.overlap_p2p_comm:  # 有overlap的warm最后一轮的处理，fwd的结果已经发送了， 需要接收梯度了
             if (
                 k == (num_warmup_microbatches - 1)
                 and not forward_only
-                and not are_all_microbatches_in_warmup
+                and not are_all_microbatches_in_warmup  # all warmup就没有提前发起接收梯度 所以需要在flush out阶段显式接收梯度 to L1478
             ):
                 input_tensor_grad = None
                 recv_next = True
-                if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                if parallel_state.is_pipeline_last_stage(ignore_virtual=True):  # 最后一个rank不需要接收梯度
                     recv_next = False
 
                 (bwd_recv_buffer[-1], bwd_wait_handles) = (
-                    p2p_communication.send_backward_recv_backward(
+                    p2p_communication.send_backward_recv_backward(  # 处理梯度 主要作用应该是接收梯度 所以发送是none 准备好接收的buffer？
                         input_tensor_grad,
                         recv_next=recv_next,
                         tensor_shape=tensor_shape,
@@ -1248,7 +1265,7 @@ def forward_backward_pipelining_with_interleaving(
                 )
                 if send_prev_wait_handle is not None:
                     send_prev_wait_handle.wait()
-                if bwd_wait_handles is not None:
+                if bwd_wait_handles is not None:  # 保存bwd的handle
                     send_prev_wait_handle = (
                         bwd_wait_handles.pop("send_prev")
                         if "send_prev" in bwd_wait_handles
@@ -1257,8 +1274,8 @@ def forward_backward_pipelining_with_interleaving(
                     if "recv_next" in bwd_wait_handles:
                         recv_next_wait_handles.append(bwd_wait_handles.pop("recv_next"))
 
-                if recv_next:
-                    output_tensor_grads[num_model_chunks - 1].append(bwd_recv_buffer[-1])
+                if recv_next:  # 保存bwd grad的buffer
+                    output_tensor_grads[num_model_chunks - 1].append(bwd_recv_buffer[-1])  # 计算chunk参数的梯度，要的是output的梯度乘以input的激活值，所以需要保存output的梯度，这个梯度是rank+1计算的
 
     # Run 1F1B in steady state.
     for k in range(num_microbatches_remaining):
@@ -1278,7 +1295,7 @@ def forward_backward_pipelining_with_interleaving(
         parallel_state.set_virtual_pipeline_model_parallel_rank(cur_model_chunk_id)
         microbatch_id = get_microbatch_id_in_model_chunk(forward_k, forward=True)
         if config.overlap_p2p_comm:
-            if not parallel_state.is_pipeline_first_stage():
+            if not parallel_state.is_pipeline_first_stage(): # 非第一阶段，第一阶段的数据不是从上游接收的
                 if config.overlap_p2p_comm_warmup_flush:
                     assert recv_prev_wait_handles, (
                         f'pp rank {pipeline_parallel_rank}, fwd iteration {forward_k}, '
@@ -1306,12 +1323,12 @@ def forward_backward_pipelining_with_interleaving(
             if parallel_state.is_pipeline_last_stage():
                 output_tensor = None
 
-            recv_prev, next_forward_model_chunk_id = recv_tensor_from_previous_stage(
+            recv_prev, next_forward_model_chunk_id = recv_tensor_from_previous_stage(  # 返回值是否接收张量 和 对应的chunk id
                 forward_k, forward=True
             )
 
             # If last iteration, don't receive; we already received one extra
-            # before the start of the for loop.
+            # before the start of the for loop. 最后一轮 不提前接收数据了 因为没有下一轮了
             if k == (num_microbatches_remaining - 1):
                 recv_prev = False
 
@@ -1338,10 +1355,10 @@ def forward_backward_pipelining_with_interleaving(
 
             # Backward pass.
             backward_k = k
-            backward_model_chunk_id = get_model_chunk_id(backward_k, forward=False)
+            backward_model_chunk_id = get_model_chunk_id(backward_k, forward=False)  # bwd的chunk顺序和fwd相反,所以也能从调度表中算出来id
             parallel_state.set_virtual_pipeline_model_parallel_rank(backward_model_chunk_id)
-            if not parallel_state.is_pipeline_last_stage():
-                if config.overlap_p2p_comm_warmup_flush:
+            if not parallel_state.is_pipeline_last_stage():  # 不是bwd的第一阶段，需要等待接收数据
+                if config.overlap_p2p_comm_warmup_flush:     # 这种情况强制要求有对应的handles
                     assert recv_next_wait_handles, (
                         f'pp rank {pipeline_parallel_rank}, bwd iteration {backward_k}, '
                         'should have registered recv next handle'
@@ -1353,7 +1370,7 @@ def forward_backward_pipelining_with_interleaving(
                         recv_next_wait_handle = recv_next_wait_handles.pop(0)
                         recv_next_wait_handle.wait()
 
-            input_tensor_grad = backward_step_helper(backward_k)
+            input_tensor_grad = backward_step_helper(backward_k)  # bwd
 
             # First virtual stage no activation gradient tensor to send.
             if parallel_state.is_pipeline_first_stage():
@@ -1382,7 +1399,7 @@ def forward_backward_pipelining_with_interleaving(
                     recv_next_wait_handles.append(bwd_wait_handles.pop("recv_next"))
 
             # Put input_tensor and output_tensor_grad in data structures in the
-            # right location.
+            # right location. 把数据放到合适的位置
             if recv_prev:
                 input_tensors[next_forward_model_chunk_id].append(
                     fwd_recv_buffer[forward_k % fwd_recv_buffer_size]
@@ -1395,12 +1412,12 @@ def forward_backward_pipelining_with_interleaving(
                 bwd_recv_buffer[(backward_k + 1) % bwd_recv_buffer_size] = None
         else:  # No p2p overlap.
             output_tensor = forward_step_helper(
-                forward_k, microbatch_id, checkpoint_activations_microbatch
+                forward_k, microbatch_id, checkpoint_activations_microbatch  # fwd
             )
 
             # Backward pass.
             backward_k = k
-            input_tensor_grad = backward_step_helper(backward_k)
+            input_tensor_grad = backward_step_helper(backward_k)             # bwd
 
             # Send output_tensor and input_tensor_grad, receive input_tensor
             # and output_tensor_grad.
@@ -1432,7 +1449,7 @@ def forward_backward_pipelining_with_interleaving(
 
             # Communicate tensors.
             (input_tensor, output_tensor_grad) = (
-                p2p_communication.send_forward_backward_recv_forward_backward(
+                p2p_communication.send_forward_backward_recv_forward_backward(    # comm
                     output_tensor,
                     input_tensor_grad,
                     recv_prev=recv_prev,
@@ -1454,18 +1471,18 @@ def forward_backward_pipelining_with_interleaving(
 
     # Run cooldown backward passes (flush out pipeline).
     if not forward_only:
-        if bwd_wait_handles is not None:
+        if bwd_wait_handles is not None:    # 等待进行bwd的数据
             for bwd_wait_handle in bwd_wait_handles.values():
                 bwd_wait_handle.wait()
 
-        if are_all_microbatches_in_warmup:
+        if are_all_microbatches_in_warmup:  # warmup结束直接开始flush out  all warmup的时候前面没有提前发起接收梯度的请求，所以这里显式接收
             output_tensor_grads[num_model_chunks - 1].append(
                 p2p_communication.recv_backward(tensor_shape, config=config)
             )
-        for k in range(num_microbatches_remaining, total_num_microbatches):
+        for k in range(num_microbatches_remaining, total_num_microbatches):  # bwd剩余数量和fwd warmup的数量相同，起始id为 num_warmup_microbatches
             cur_model_chunk_id = get_model_chunk_id(k, forward=False)
             parallel_state.set_virtual_pipeline_model_parallel_rank(cur_model_chunk_id)
-            if not parallel_state.is_pipeline_last_stage() and k != 0:
+            if not parallel_state.is_pipeline_last_stage() and k != 0:  # 非bwd的第一stage，需要接收数据
                 if config.overlap_p2p_comm_warmup_flush:
                     assert recv_next_wait_handles, (
                         f'pp rank {pipeline_parallel_rank}, backward iteration {k}, '
@@ -1486,7 +1503,7 @@ def forward_backward_pipelining_with_interleaving(
                 recv_next = False
 
             # Prefetch recv for backward iteration k+1 for non last ranks.
-            if config.overlap_p2p_comm_warmup_flush and not parallel_state.is_pipeline_last_stage(
+            if config.overlap_p2p_comm_warmup_flush and not parallel_state.is_pipeline_last_stage(  # 和fwd类似的prefetch
                 ignore_virtual=True
             ):
                 bwd_recv_buffer[k % bwd_recv_buffer_size], bwd_wait_recv_handles = (
@@ -1502,7 +1519,7 @@ def forward_backward_pipelining_with_interleaving(
                 if bwd_wait_recv_handles:
                     recv_next_wait_handles.append(bwd_wait_recv_handles.pop("recv_next"))
 
-            input_tensor_grad = backward_step_helper(k)
+            input_tensor_grad = backward_step_helper(k)  # bwd
 
             # First virtual stage no activation gradient tensor to send.
             if parallel_state.is_pipeline_first_stage():
@@ -1512,7 +1529,7 @@ def forward_backward_pipelining_with_interleaving(
                 if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
                     _, bwd_wait_handles = p2p_communication.send_backward_recv_backward(
                         input_tensor_grad,
-                        recv_next=False,
+                        recv_next=False,           #非最后一个rank，有预取
                         tensor_shape=tensor_shape,
                         config=config,
                         overlap_p2p_comm=True,
@@ -1573,7 +1590,7 @@ def forward_backward_pipelining_with_interleaving(
     if config.finalize_model_grads_func is not None and not forward_only:
 
         # If defer_embedding_wgrad_compute is enabled we need to do the
-        # weight gradient GEMM's here.
+        # weight gradient GEMM's here. 推迟embedding权重梯度的计算到pipeline的最后
         finish_embedding_wgrad_compute(config, embedding_module)
 
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
