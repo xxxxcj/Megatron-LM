@@ -105,7 +105,7 @@ class FusedDispatch(torch.autograd.Function):
         # from gpt: 这段逻辑里 CPU 要等 GPU 发信号，这会造成同步阻塞，打破 CUDA Graph 的连续性，所以不能用 CUDA Graph 来录制这部分流程
         (
             recv_x,              # 接收到的token数据, token数量等于当前rank接收到的token总数
-            recv_token_indices,  # 接收到的expert索引 [num_recv_tokens, num_topk]
+            recv_token_indices,  # 接收到的expert索引 [num_recv_tokens, num_topk]  系统会将全局专家索引转换为本地专家索引。如果某个专家不属于当前 rank，其索引会被设置为 -1 (from deepwiki)
             recv_token_probs,    # 接收到的expert权重 [num_recv_tokens, num_topk]
             num_recv_tokens_per_expert_list,  # 表示每个本地expert接收到的token数量
             handle,

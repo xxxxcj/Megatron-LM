@@ -663,14 +663,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             if self.drop_and_pad:
                 global_input_tokens = (
                     global_input_tokens.view(
-                        self.tp_size * self.ep_size,
-                        self.num_local_experts,
-                        self.capacity,
-                        *global_input_tokens.size()[1:],
+                        self.tp_size * self.ep_size,      # ep_size (相当于这个维度标注了这部分token来自哪个rank)
+                        self.num_local_experts,           # num_local_experts
+                        self.capacity,                    # 每个专家要处理的token数量
+                        *global_input_tokens.size()[1:],  # hidden size
                     )
-                    .transpose(0, 1)
+                    .transpose(0, 1)  # transpose之后得到每个专家处理哪些token
                     .contiguous()
-                    .flatten(start_dim=0, end_dim=2)
+                    .flatten(start_dim=0, end_dim=2)  # ->[num_tokens, hidden_size]
                 )
                 global_probs = (
                     global_probs.view(

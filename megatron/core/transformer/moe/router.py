@@ -406,7 +406,7 @@ class TopKRouter(Router):
         logits = logits.view(-1, self.config.num_moe_experts)
 
         # Apply Z-Loss
-        logits = self.apply_z_loss(logits)
+        logits = self.apply_z_loss(logits)  # 用来保证softmax之前值的稳定性，防止单个值过大，softmax之后某个值为1其他全为0
 
         if self.routing_type == "sinkhorn":
             scores, routing_map = self.sinkhorn_load_balancing(logits)
