@@ -266,7 +266,7 @@ def permute(
     if fused and probs is None:
         if not HAVE_TE or fused_permute is None:
             raise ValueError("fused_permute is not available. Please install TE >= 2.1.0.")
-        permuted_input, sorted_indices = fused_permute(
+        permuted_input, sorted_indices = fused_permute(  # only permute tokens
             tokens, routing_map, num_out_tokens=num_out_tokens
         )
         return permuted_input, None, sorted_indices
@@ -276,7 +276,7 @@ def permute(
             raise ValueError(
                 "fused_permute_with_probs is not available. Please install TE >= 2.1.0."
             )
-        return fused_permute_with_probs(tokens, probs, routing_map, num_out_tokens=num_out_tokens)
+        return fused_permute_with_probs(tokens, probs, routing_map, num_out_tokens=num_out_tokens)  # permute tokens and probs
 
     num_tokens, hidden = tokens.shape
     num_experts = routing_map.shape[1]

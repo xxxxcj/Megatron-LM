@@ -453,10 +453,10 @@ class TopKRouter(Router):
         logits = self.gating(input)
 
         if self.config.moe_router_force_load_balancing:
-            # Apply force load balancing with random logits for benchmark
+            # Apply force load balancing with random logits for benchmark 随机route，用于benchmark
             logits = apply_random_logits(logits)
 
-        scores, routing_map = self.routing(logits)
+        scores, routing_map = self.routing(logits)  # TopK/GroupTopK score是归一化之后的分数
 
         return scores, routing_map
 

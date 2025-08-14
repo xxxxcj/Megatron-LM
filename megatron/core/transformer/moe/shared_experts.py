@@ -147,7 +147,7 @@ class SharedExpertMLP(MLP):
         assert self.cached_fc1_input is not None
         if overlapped_comm_output is not None:
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
-        with torch.cuda.stream(self.stream):
+        with torch.cuda.stream(self.stream): #切换stream以实现异步
             # [s, b, 4 * h/p]
             intermediate_parallel, bias_parallel = self.linear_fc1(self.cached_fc1_input)
             self.cached_fc1_input = None

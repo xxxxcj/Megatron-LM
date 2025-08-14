@@ -62,7 +62,7 @@ class BaseMoELayer(MegatronModule, ABC):
         assert ep_size > 0, "Expected non-negative expert parallel size"
 
         assert self.config.num_moe_experts % ep_size == 0
-        self.num_local_experts = self.config.num_moe_experts // ep_size
+        self.num_local_experts = self.config.num_moe_experts // ep_size    # 每个ep_rank负责的专家数量
         local_expert_indices_offset = ep_rank * self.num_local_experts
 
         self.use_shared_expert = self.config.moe_shared_expert_intermediate_size is not None
@@ -197,15 +197,15 @@ class MoELayer(BaseMoELayer):
         combine step.
         """
         shared_expert_output = None
-        if self.use_shared_expert and not self.shared_expert_overlap:
+        if self.use_shared_expert and not self.shared_expert_overlap:  # 非overlap时在这里计算，overlap时在dispather中计算
             # Compute the shared expert separately when not overlapped with communication.
             shared_expert_output = self.shared_experts(residual)
         dispatched_input, tokens_per_expert, permuted_probs = (
-            self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
+            self.token_dispatcher.dispatch_postprocess(hidden_states, probs)  # 重排  在这里面进行的shared expert的overlap/deepep在这里做rank内token的复制
         )
         expert_output, mlp_bias = self.experts(dispatched_input, tokens_per_expert, permuted_probs)
         assert mlp_bias is None, f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-        output = self.token_dispatcher.combine_preprocess(expert_output)
+        output = self.token_dispatcher.combine_preprocess(expert_output)  # 重排回之前的状态
 
         return output, shared_expert_output, mlp_bias
 
@@ -217,7 +217,7 @@ class MoELayer(BaseMoELayer):
         from the shared expert if it exists.
         """
         output = self.token_dispatcher.token_combine(output)
-        output = self.token_dispatcher.combine_postprocess(output)
+        output = self.token_dispatcher.combine_postprocess(output)  # 这里会进行shared expert的overlap
         if shared_expert_output is not None:
             output = output + shared_expert_output
         return output
@@ -250,7 +250,7 @@ class MoELayer(BaseMoELayer):
             output, shared_expert_output, mlp_bias = self.experts_compute(
                 dispatched_input, probs, residual
             )
-            output = self.combine(output, shared_expert_output)
+            output = self.combine(output, shared_expert_output)  # 这里加上shared_expert_output
             return output, mlp_bias
 
         if self.moe_layer_recompute:

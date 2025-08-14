@@ -2795,7 +2795,7 @@ def _add_moe_args(parser):
     group.add_argument('--moe-z-loss-coeff', type=float, default=None,
                        help='Scaling coefficient for the z-loss: a starting value of 1e-3 is recommended.')
     group.add_argument('--moe-input-jitter-eps', type=float, default=None,
-                       help='Add noise to the input tensor by applying jitter with a specified epsilon value.')
+                       help='Add noise to the input tensor by applying jitter with a specified epsilon value.')  # 加noise去鼓励探索新专家
     group.add_argument('--moe-per-layer-logging', action='store_true',
                        help='Enable per-layer logging for MoE, currently supports auxiliary loss and z loss.')
     # Token dispatcher arguments

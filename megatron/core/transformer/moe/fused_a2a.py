@@ -76,7 +76,7 @@ class FusedDispatch(torch.autograd.Function):
         token_probs,
         num_experts,
         group,
-        async_finish=False,
+        async_finish=False,  # 通信和计算(默认流)异步flag，if false 计算流会等待通信流完成再继续
         allocate_on_comm_stream=False,
     ):
         """Forward pass of fused dispatch."""
@@ -86,10 +86,10 @@ class FusedDispatch(torch.autograd.Function):
         # Calculate layout before actual dispatch
         buffer = get_buffer(group, get_hidden_bytes(x))
         (
-            num_tokens_per_rank,
-            num_tokens_per_rdma_rank,
-            num_tokens_per_expert,
-            is_token_in_rank,
+            num_tokens_per_rank,       # [num_ranks] 需要发送到每个rank的token数量
+            num_tokens_per_rdma_rank,  # [num_rdma_ranks] 需要发送到每个RDMA rank的token数量
+            num_tokens_per_expert,     # [num_experts] 每个expert需要接收的token数量
+            is_token_in_rank,          # [num_tokens, num_ranks] 每个token是否会被发送到对应的rank 路由/map
             event,
         ) = buffer.get_dispatch_layout(
             token_indices,
@@ -102,11 +102,12 @@ class FusedDispatch(torch.autograd.Function):
         # Do MoE dispatch
         # NOTES: the CPU will wait for GPU's signal to arrive,
         # so this is not compatible with CUDA graph
+        # from gpt: 这段逻辑里 CPU 要等 GPU 发信号，这会造成同步阻塞，打破 CUDA Graph 的连续性，所以不能用 CUDA Graph 来录制这部分流程
         (
-            recv_x,
-            recv_token_indices,
-            recv_token_probs,
-            num_recv_tokens_per_expert_list,
+            recv_x,              # 接收到的token数据, token数量等于当前rank接收到的token总数
+            recv_token_indices,  # 接收到的expert索引 [num_recv_tokens, num_topk]
+            recv_token_probs,    # 接收到的expert权重 [num_recv_tokens, num_topk]
+            num_recv_tokens_per_expert_list,  # 表示每个本地expert接收到的token数量
             handle,
             after_event_overlap,
         ) = buffer.dispatch(
@@ -124,7 +125,7 @@ class FusedDispatch(torch.autograd.Function):
 
         # Make sure current stream is synchronized
         if async_finish:
-            after_event_overlap.current_stream_wait()
+            after_event_overlap.current_stream_wait()  # 异步还是需要等待通信完成 感觉overlap得比较少？
 
         # Save for backward
         ctx.group = group

@@ -441,11 +441,11 @@ class _AllToAll(torch.autograd.Function):
                 dtype=input.dtype,
                 device=torch.cuda.current_device(),
             )
-        torch.distributed.all_to_all_single(
+        torch.distributed.all_to_all_single(  # 将自己的一部分数据发送给每个其他节点，并从其他节点接收对应部分的数据
             output,
             input,
-            output_split_sizes=output_split_sizes,
-            input_split_sizes=input_split_sizes,
+            output_split_sizes=output_split_sizes,  # 当前 rank 从每个 rank 接收的数据块大小
+            input_split_sizes=input_split_sizes,    # 当前 rank 要发送给每个 rank 的数据块大小
             group=group,
         )
         return output

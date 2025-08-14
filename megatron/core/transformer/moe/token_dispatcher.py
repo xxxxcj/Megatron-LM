@@ -483,14 +483,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             # ===================================================
             # [ep_size]. Represents the number of tokens sent by the current rank to other
             # EP ranks.
-            self.input_splits = num_local_tokens_per_expert.reshape(
+            self.input_splits = num_local_tokens_per_expert.reshape(  # reshape成每个rank处理多少token
                 self.ep_size, self.num_local_experts
             ).sum(axis=1)
             # Gather the global distribution of tokens across ranks.
             # num_global_tokens_per_expert represents the number of tokens sent to each
             # expert by all ranks.
             # [tp_size, ep_size, num_experts]
-            num_global_tokens_per_expert = (
+            num_global_tokens_per_expert = (  # gather成每个rank的每个expert处理多少token
                 gather_from_sequence_parallel_region(
                     num_local_tokens_per_expert, group=self.tp_ep_group
                 )
@@ -577,8 +577,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 self.routing_map = pad_routing_map(self.routing_map, pad_multiple)
         self.tokens_per_expert = self.preprocess(self.routing_map)
 
-        if self.shared_experts is not None:
-            self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
+        if self.shared_experts is not None:  # dispather中的shared_experts在需要overlap时才会被赋值
+            self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape)) # 这个pre comm应该是在有tp的时候提前把tp的数据收集起来走shared expert的forward
 
         # Permutation 1: input to AlltoAll input
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
@@ -586,13 +586,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         )
         self.hidden_shape_before_permute = hidden_states.shape
         (
-            permutated_local_input_tokens,
-            permuted_probs,
-            self.reversed_local_input_permutation_mapping,
+            permutated_local_input_tokens,  # [b*s*ep, h]
+            permuted_probs,                 # [b*s*ep]
+            self.reversed_local_input_permutation_mapping,  # [e， b*s] 记录了token到permutated_local_input_tokens索引映射表
         ) = permute(
-            hidden_states,
-            self.routing_map,
-            probs=probs,
+            hidden_states,     # [b*s, h]
+            self.routing_map,  # [b*s, e]
+            probs=probs,       # [b*s, e]
             num_out_tokens=self.num_out_tokens,
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
@@ -686,8 +686,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             else:
                 global_input_tokens, global_probs = sort_chunks_by_idxs(
                     global_input_tokens,
-                    self.num_global_tokens_per_local_expert.ravel(),
-                    self.sort_input_by_local_experts,
+                    self.num_global_tokens_per_local_expert.ravel(),  # 每个chunk数据的大小
+                    self.sort_input_by_local_experts,                 # [0, 3, 1, 4] 代表要将idx0的chunk放到第0个位置，idx3的chunk放到第1个位置。。。
                     probs=global_probs,
                     fused=self.config.moe_permute_fusion,
                 )
@@ -814,13 +814,13 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         ):
             self.cuda_sync_point = point
 
-    def _maybe_dtoh_and_synchronize(
+    def _maybe_dtoh_and_synchronize(  # dtoh == device to host
         self, point: str, tokens_per_expert: torch.Tensor = None
     ) -> torch.Tensor:
         """
         Move all possible GPU tensors to CPU and make a synchronization at the expected point.
         """
-        if not self.drop_and_pad:
+        if not self.drop_and_pad:  #在容量填充模式下，这些元数据是静态的，不需要动态传输
             if point == self.cuda_dtoh_point:
                 # Move all possible GPU tensors to CPU at self.cuda_dtoh_point.
                 on_side_stream = torch.cuda.current_stream() != self.cuda_dtoh_stream
@@ -945,7 +945,7 @@ class _DeepepManager(_DispatchManager):
         self.config = config
 
         self.router_topk = router_topk
-        self.num_experts = num_experts
+        self.num_experts = num_experts  # tp_size * num_moe_experts
         self.router_dtype = config.moe_router_dtype
         self.capacity_factor = config.moe_expert_capacity_factor
         self.permute_fusion = config.moe_permute_fusion
@@ -1098,7 +1098,7 @@ class _DeepepManager(_DispatchManager):
                 self.dispatched_indices, self.dispatched_probs, self.num_local_experts
             )
         else:
-            self.dispatched_routing_map, self.dispatched_probs = self._indices_to_multihot(
+            self.dispatched_routing_map, self.dispatched_probs = self._indices_to_multihot(  # [num_tokens, num_local_experts]
                 self.dispatched_indices, self.dispatched_probs
             )
         if self.config.moe_router_padding_for_fp8:
@@ -1108,7 +1108,7 @@ class _DeepepManager(_DispatchManager):
 
         self.hidden_shape_before_permute = hidden_states.shape
         assert self.dispatched_probs.dtype == torch.float32, "DeepEP only supports float32 probs"
-        hidden_states, permuted_probs, self.reversed_mapping_for_combine = permute(
+        hidden_states, permuted_probs, self.reversed_mapping_for_combine = permute(  # 将没有重复的token按照expert处理的格式进行permute
             hidden_states,
             self.dispatched_routing_map,
             probs=self.dispatched_probs,
@@ -1191,6 +1191,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         num_local_tokens = routing_map.shape[0]
         world_size = self.tp_size * self.ep_size
         # Organize routing map and probs to [num_local_tokens, world_size, num_local_experts]
+        # 从数据需求/通信角度看tp和ep是一样的，都需要一个完整的token进行处理，所以合并成world size
         routing_map = (
             routing_map.reshape(num_local_tokens, self.ep_size, 1, self.num_local_experts)
             .expand(-1, -1, self.tp_size, -1)
@@ -1221,10 +1222,11 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             A tuple of reshaped hidden states and token probabilities.
         """
         self.hidden_shape = hidden_states.shape
-        hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+        hidden_states = hidden_states.view(-1, self.hidden_shape[-1])  # [b*s, h]
 
         # Initialize metadata
-        routing_map, probs = self._initialize_metadata(routing_map, probs)
+        # [num_local_tokens, world_size, num_local_experts] 相当记录了每个token有哪个设备的哪个专家处理
+        routing_map, probs = self._initialize_metadata(routing_map, probs)  
 
         self._comm_manager.setup_metadata(routing_map, probs)
         return hidden_states, self._comm_manager.token_probs
