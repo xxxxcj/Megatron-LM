@@ -44,11 +44,11 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
     def __init__(
         self,
-        params,
+        params,  # 参数group，bias不需要weight decay，所以需要分成两组
         offload_fraction=0.5,
         cpu_optimizer_cls=None,
         gpu_optimizer_cls=None,
-        param_update_in_fp32: bool = False,
+        param_update_in_fp32: bool = False,  # HDO中强制为true
         pin_cpu_grads: bool = True,
         pin_cpu_params: bool = True,
         overlap_cpu_optimizer_d2h_h2d: bool = True,
@@ -114,15 +114,15 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 self.cpu_copy_map_grad[param].data.copy_(grad, non_blocking=True)
             self._cpu_optimizer_map_data_event[optimizer] = self._d2h_stream.record_event()
 
-    def _register_param_copy_back_gpu_hook(self):
+    def _register_param_copy_back_gpu_hook(self):  # 这个函数给每个子优化器注册 “step 后的回调 hook”，把在 CPU 上更新的参数异步复制回 GPU（以及在需要时把 FP32 主参数复制回模型参数）
         def param_copy_back_gpu_hook_closure():
             def param_copy_back_gpu_hook(optimizer, args, kwargs):
-                self._h2d_stream.wait_stream(torch.cuda.current_stream())
+                self._h2d_stream.wait_stream(torch.cuda.current_stream())  # 单纯做一个同步？权重拷贝流等计算流
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
                         gpu_param.data.copy_(param.data, non_blocking=True)
-                self._d2h_stream.record_event().wait(torch.cuda.current_stream())
+                self._d2h_stream.record_event().wait(torch.cuda.current_stream())  #让计算流等grad的拷贝流，这个会导致第二次调用这个hook函数的时候阻塞，等grad拷贝全完成
 
             return param_copy_back_gpu_hook
 
@@ -159,8 +159,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         # the lr, wd, etc. are up-to-date.
         self._sync_hdo_param_groups_to_sub_optimizers()
 
-        self._d2h_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self._d2h_stream):
+        self._d2h_stream.wait_stream(torch.cuda.current_stream())  # 可能计算流还在处理梯度(比如梯度clip，放缩。。。)，等计算流处理完再拷贝梯度
+        with torch.cuda.stream(self._d2h_stream):                  # wait并不会阻塞host上代码的执行，只会告诉d2h_stream等计算流到wait这个事件点再执行后续操作
             self._set_sub_optimizer_grads()
 
         # Step the sub-optimizers.
@@ -170,8 +170,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         for cpu_optimizer in self.cpu_optimizers:
             d2h_event = self._cpu_optimizer_map_data_event.pop(cpu_optimizer, None)
             if d2h_event is not None:
-                d2h_event.synchronize()
-            cpu_optimizer.step(closure)
+                d2h_event.synchronize()  # 因为马上cpu需要使用这部分梯度，所以要等待GPU到CPU的梯度拷贝完成
+            cpu_optimizer.step(closure)  # 这里执行完step之后会调用注册的hook，把参数复制回GPU
 
         # Sync state and param_groups to HDO after each step.
         # NOTE: It is possible for the optimizer to change the properties
@@ -179,13 +179,15 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self._sync_sub_optimizers_state_to_hdo()
 
     def _init_sub_optimizers(self):
+
         (
             self.cpu_param_groups,
             self.gpu_param_groups,
             self.gpu_params_map_cpu_copy,
             self.cpu_copys_map_gpu_param,
-            self.param_to_fp32_param,
+            self.param_to_fp32_param,  # 这里面的参数混合了cpu和gpu的
         ) = self._get_sub_optimizer_param_groups(self.offload_fraction)
+        
         self.param_to_inner_param = {}
         self.inner_param_to_orig_param = {}
         for group in self.param_groups:
@@ -202,7 +204,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
         self.cpu_optimizers = []
         if self.overlap_cpu_optimizer_d2h_h2d:
-            self.cpu_optimizers = self.build_cpu_optimizer_list(
+            self.cpu_optimizers = self.build_cpu_optimizer_list(  # 创建一堆优化器 每个负责一个权重矩阵
                 self.cpu_optimizer_cls, self.cpu_param_groups
             )
         elif len(self.cpu_param_groups) > 0:
@@ -213,12 +215,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         else:
             self.gpu_optimizer = None
 
-        self.cpu_copy_map_grad: Dict[torch.Tensor, torch.Tensor] = defaultdict(torch.Tensor)
+        self.cpu_copy_map_grad: Dict[torch.Tensor, torch.Tensor] = defaultdict(torch.Tensor)  # cpu copy to grad in cpu
         self._d2h_stream = torch.cuda.current_stream()
         self._h2d_stream = torch.cuda.current_stream()
         if self.overlap_cpu_optimizer_d2h_h2d:
-            self._d2h_stream = torch.cuda.Stream()
-            self._h2d_stream = torch.cuda.Stream()
+            self._d2h_stream = torch.cuda.Stream()  # 拷贝梯度到cpu的流
+            self._h2d_stream = torch.cuda.Stream()  # 拷贝参数到gpu的流
         self._cpu_optimizer_map_data_event = dict()
 
         self._register_param_copy_back_gpu_hook()
@@ -244,11 +246,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 params = [params]
             for param in params:
                 _cpu_param_group = group_defaults.copy()
-                _cpu_param_group["params"] = [param]
+                _cpu_param_group["params"] = [param]  # 参数就剩这一个了
                 cpu_optimizers.append(cpu_optimizer_cls([_cpu_param_group]))
         return cpu_optimizers
 
     def _get_sub_optimizer_param_groups(self, offload_fraction: float):
+        # 统计参数总量，方便设置阈值
         params = []
         for group in self.param_groups:
             params.extend(group["params"])
@@ -257,6 +260,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         cpu_params_total_numel = params_total_numel - gpu_params_total_numel
         offload_threshold = gpu_params_total_numel * offload_fraction
         offload_params_numel = 0
+
+        # 将参数划分到cpu和gpu
         cpu_param_groups = []
         gpu_param_groups = []
         gpu_params_map_cpu_copy = {}
@@ -270,12 +275,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
             for param in group["params"]:
                 orig_param = param
                 cpu_copy = False
-                if offload_params_numel < offload_threshold and param.is_cuda:
+                if offload_params_numel < offload_threshold and param.is_cuda:  # 不会拆权重矩阵
                     param = param.detach().clone().cpu().pin_memory()
                     offload_params_numel += param.numel()
                     cpu_copy = True
                 if self.param_update_in_fp32 and param.dtype != torch.float32:
-                    param = param.detach().clone().float()
+                    param = param.detach().clone().float()  # 这里cpu上的param又不是pin的了，后面h2d不能异步
                     param_to_fp32_param[orig_param] = param
 
                 if cpu_copy:
