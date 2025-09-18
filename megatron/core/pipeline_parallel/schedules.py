@@ -896,8 +896,8 @@ def forward_backward_pipelining_with_interleaving(
         max_outstanding_backprops = num_warmup_microbatches + 1
 
     # Synchronize params for first two model chunks
-    if config.param_sync_func is not None:
-        config.param_sync_func[0](model[0].parameters())
+    if config.param_sync_func is not None:                # 在这里触发start_param_sync 一开始是disable的 防止加载ckpt或随机参数初始化的问题
+        config.param_sync_func[0](model[0].parameters())  # 不同对象的同一方法被绑定后这个引用还是调用原有对象的对应方法，有self参数，而parameter的这个生成器已经是第二个参数了(在实现中对应*unused)
         config.param_sync_func[1](model[1].parameters())
 
     # Create a tunable schedule lookup table.
@@ -1089,11 +1089,12 @@ def forward_backward_pipelining_with_interleaving(
         """Helper method to run backward step with model split into chunks"""
         model_chunk_id = get_model_chunk_id(virtual_microbatch_id, forward=False)
 
-        # launch grad synchronization (default)
+        # launch grad synchronization (default)  
+        # grad_sync_func是None说明没有开启align grad sync，所以只要enable grad sync就行，bwd结束会自动在post hook发起同步
         if config.grad_sync_func is None and is_last_microbatch_for_model_chunk(
             virtual_microbatch_id
         ):
-            enable_grad_sync()
+            enable_grad_sync()  # 这个context manager内部也将is_last_microbatch设为了true，所以bucket group启动同步
             synchronized_model_chunks.add(model_chunk_id)
 
         # pylint: disable=E0606

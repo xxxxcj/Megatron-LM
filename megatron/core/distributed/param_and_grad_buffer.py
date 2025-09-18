@@ -287,7 +287,7 @@ class _ParamAndGradBucketGroup:
                         "hurt the communication-computation overlap performance."
                     )
                 else:
-                    self.next_param_gather_bucket_group.start_param_sync()
+                    self.next_param_gather_bucket_group.start_param_sync()  # 这里发起的下一个bucket group的参数同步，到下一个bucket group才会wait
 
     def start_grad_sync(self):
         """
